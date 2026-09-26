@@ -5,6 +5,7 @@
 //
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <mysql/mysql.h>
 
@@ -58,6 +59,7 @@ typedef struct {
     char day_of_week[20];
     char start_time[20];
     char end_time[20];
+    char session_type[20];
 
 } Session;
 
@@ -225,7 +227,8 @@ int loadSessions(MYSQL *conn, Session sessions[]) {
         "r.room_number, "
         "ts.day_of_week, "
         "ts.start_time, "
-        "ts.end_time "
+        "ts.end_time, "
+        "cs.session_type "
 
         "FROM class_sessions cs "
 
@@ -358,6 +361,15 @@ int loadSessions(MYSQL *conn, Session sessions[]) {
             sizeof(sessions[count].end_time) - 1
         ] = '\0';
 
+        strncpy(
+            sessions[count].session_type,
+            row[13],
+            sizeof(sessions[count].session_type) - 1
+        );
+
+        sessions[count].session_type[
+            sizeof(sessions[count].session_type) - 1
+        ] = '\0';
 
         count++;
     }
@@ -553,80 +565,76 @@ int graphColoring(
     int color[],
     int totalSlots,
     int course
-) {
-
-    /*
-     * Base case:
-     *
-     * Every course has been assigned
-     * a time slot.
-     */
-
-    if (course == graph->vertices) {
-
+)
+{
+    // All courses assigned
+    if (course == graph->vertices)
+    {
         return 1;
     }
 
+    // If this class already has a fixed slot,
+    // keep that slot and move to the next class.
+    if (color[course] != -1)
+    {
+        if (!isSafe(
+                graph,
+                course,
+                color[course],
+                color))
+        {
+            return 0;
+        }
 
-    /*
-     * Try every available slot.
-     */
+        return graphColoring(
+            graph,
+            color,
+            totalSlots,
+            course + 1
+        );
+    }
 
-    for (int slot = 0; slot < totalSlots; slot++) {
-
-
-        /*
-         * Check whether this slot is safe.
-         */
-
+    // Otherwise try available slots
+    for (int slot = 0; slot < totalSlots; slot++)
+    {
         if (isSafe(
                 graph,
                 course,
                 slot,
-                color)) {
-
-
-            /*
-             * Assign slot.
-             */
-
+                color))
+        {
             color[course] = slot;
-
-
-            /*
-             * Try assigning a slot
-             * to the next course.
-             */
 
             if (graphColoring(
                     graph,
                     color,
                     totalSlots,
-                    course + 1)) {
-
+                    course + 1))
+            {
                 return 1;
             }
 
-
-            /*
-             * BACKTRACK
-             *
-             * If the choice caused a conflict,
-             * remove it and try another slot.
-             */
-
+            // Backtrack
             color[course] = -1;
         }
     }
 
-
-    /*
-     * No slot worked.
-     */
-
     return 0;
 }
 
+
+int findSlotIndex(TimeSlot slots[], int slotCount, int slot_id)
+{
+    for (int i = 0; i < slotCount; i++)
+    {
+        if (slots[i].slot_id == slot_id)
+        {
+            return i;
+        }
+    }
+
+    return -1;
+}
 
 // DISPLAY GENERATED TIMETABLE
 
@@ -656,6 +664,9 @@ void displayTimetable(
 
         printf("Panel   : %s\n",
                sessions[i].panel_name);
+
+        printf("Type    : %s\n",
+                sessions[i].session_type);
 
         printf("Time    : %s %s - %s\n",
                slots[slotIndex].day_of_week,
@@ -896,26 +907,59 @@ void viewNotifications(
 
 void createAvailableSlotNotifications(
     MYSQL *conn,
-    int session_id
-) {
+    int released_session_id
+)
+{
+    char query[2000];
 
-    char query[1500];
+    /*
+     * Remove old notifications for this released slot.
+     */
+    snprintf(
+        query,
+        sizeof(query),
+        "DELETE FROM notifications "
+        "WHERE session_id = %d "
+        "AND notification_type = 'AVAILABLE_SLOT'",
+        released_session_id
+    );
 
+    if (mysql_query(conn, query) != 0)
+    {
+        printf(
+            "Failed to clear old notifications: %s\n",
+            mysql_error(conn)
+        );
+        return;
+    }
+
+
+    /*
+     * Create notifications only for:
+     *
+     * 1. Pending makeup requests
+     * 2. Faculty assigned to the affected panel
+     * 3. Faculty who are not the original teacher
+     */
     snprintf(
         query,
         sizeof(query),
 
         "INSERT INTO notifications "
-        "(faculty_id, session_id, message, "
-        "notification_type, response_status) "
+        "(faculty_id, session_id, makeup_request_id, "
+        "available_room_id, available_slot_id, "
+        "message, notification_type, response_status) "
 
         "SELECT "
-        "fa.faculty_id, "
-        "%d, "
+        "mr.faculty_id, "
+        "released.session_id, "
+        "mr.request_id, "
+        "released.room_id, "
+        "released.slot_id, "
 
         "CONCAT("
-        "'A class slot has become available: ', "
-        "p.panel_name, ', ', "
+        "'Makeup slot available for ', "
+        "c.course_name, ': ', "
         "ts.day_of_week, ' ', "
         "ts.start_time, '-', ts.end_time, "
         "', Room ', r.room_number"
@@ -924,84 +968,133 @@ void createAvailableSlotNotifications(
         "'AVAILABLE_SLOT', "
         "'PENDING' "
 
-        "FROM class_sessions cs "
+        "FROM makeup_requests mr "
+
+        "JOIN class_sessions original "
+        "ON mr.session_id = original.session_id "
+
+        "JOIN courses c "
+        "ON original.course_id = c.course_id "
+
+        "JOIN class_sessions released "
+        "ON released.session_id = %d "
 
         "JOIN panels p "
-        "ON cs.panel_id = p.panel_id "
+        "ON released.panel_id = p.panel_id "
 
         "JOIN time_slots ts "
-        "ON cs.slot_id = ts.slot_id "
+        "ON released.slot_id = ts.slot_id "
 
         "JOIN rooms r "
-        "ON cs.room_id = r.room_id "
+        "ON released.room_id = r.room_id "
 
         "JOIN faculty_assignments fa "
-        "ON fa.panel_id = cs.panel_id "
+        "ON fa.faculty_id = mr.faculty_id "
+        "AND fa.panel_id = released.panel_id "
 
-        "WHERE cs.session_id = %d "
+        "WHERE mr.status = 'PENDING' "
 
-        "AND fa.faculty_id <> cs.faculty_id "
+        "AND released.status = 'CANCELLED' "
+
+        "AND mr.faculty_id <> released.faculty_id "
 
         "AND NOT EXISTS ("
         "SELECT 1 "
         "FROM notifications n "
-        "WHERE n.faculty_id = fa.faculty_id "
-        "AND n.session_id = cs.session_id "
-        "AND n.notification_type = 'AVAILABLE_SLOT'"
+        "WHERE n.faculty_id = mr.faculty_id "
+        "AND n.session_id = released.session_id "
+        "AND n.makeup_request_id = mr.request_id "
+        "AND n.notification_type = 'AVAILABLE_SLOT' "
         "AND n.response_status = 'PENDING'"
         ")",
 
-        session_id,
-        session_id
+        released_session_id
     );
 
-    if (mysql_query(conn, query) != 0) {
 
+    if (mysql_query(conn, query) != 0)
+    {
         printf(
             "Failed to create notifications: %s\n",
             mysql_error(conn)
         );
-
         return;
     }
 
+
     printf(
-        "%llu teacher notification(s) created.\n",
+        "%llu makeup notification(s) created.\n",
         mysql_affected_rows(conn)
     );
 }
 
 // Add classes canceled to the table
 
-void cancelClass(MYSQL *conn, int session_id) {
+void cancelClass(MYSQL *conn, int faculty_id)
+{
+    int session_id;
+
+    printf("\n========================================\n");
+    printf("             CANCEL CLASS\n");
+    printf("========================================\n");
+
+    printf("\nEnter Session ID to cancel: ");
+    scanf("%d", &session_id);
+
 
     char query[512];
 
     snprintf(
         query,
         sizeof(query),
+
         "UPDATE class_sessions "
         "SET status = 'CANCELLED' "
         "WHERE session_id = %d "
+        "AND faculty_id = %d "
         "AND status = 'SCHEDULED'",
-        session_id
+
+        session_id,
+        faculty_id
     );
 
-    if (mysql_query(conn, query) != 0) {
-        printf("Failed to cancel class: %s\n",
-               mysql_error(conn));
+
+    if (mysql_query(conn, query) != 0)
+    {
+        printf(
+            "Failed to cancel class: %s\n",
+            mysql_error(conn)
+        );
+
         return;
     }
 
-    if (mysql_affected_rows(conn) == 0) {
-        printf("Class not found or already cancelled.\n");
+
+    if (mysql_affected_rows(conn) == 0)
+    {
+        printf(
+            "\nClass not found, not assigned to you, "
+            "or already cancelled.\n"
+        );
+
         return;
     }
 
-    printf("\nClass cancelled successfully.\n");
 
-    createAvailableSlotNotifications(conn, session_id);
+    printf(
+        "\nClass cancelled successfully!\n"
+    );
+
+
+    // Create notifications for other teachers
+
+    createAvailableSlotNotifications(
+        conn,
+        session_id
+    );
 }
+
+void generateTimetable(MYSQL *conn);
 void showNotifications(MYSQL *conn, int faculty_id);
 void respondToNotification(MYSQL *conn, int notification_id, int faculty_id);
 
@@ -1100,30 +1193,52 @@ void showNotifications(MYSQL *conn, int faculty_id)
     mysql_free_result(result);
 }
 
-void respondToNotification(MYSQL *conn, int notification_id, int faculty_id)
+void respondToNotification(
+    MYSQL *conn,
+    int notification_id,
+    int faculty_id
+)
 {
-    char query[1000];
+    char query[2000];
 
-    /*
-     * First find the session associated with this notification.
-     */
 
-    snprintf(query, sizeof(query),
-        "SELECT session_id "
+    // Get notification details
+
+    snprintf(
+        query,
+        sizeof(query),
+
+        "SELECT "
+        "session_id, "
+        "makeup_request_id, "
+        "available_room_id, "
+        "available_slot_id "
+
         "FROM notifications "
+
         "WHERE notification_id = %d "
         "AND faculty_id = %d "
+        "AND notification_type = 'AVAILABLE_SLOT' "
         "AND response_status = 'PENDING'",
-        notification_id, faculty_id);
+
+        notification_id,
+        faculty_id
+    );
+
 
     if (mysql_query(conn, query) != 0)
     {
-        printf("Failed to find notification: %s\n",
-               mysql_error(conn));
+        printf(
+            "Failed to find notification: %s\n",
+            mysql_error(conn)
+        );
         return;
     }
 
-    MYSQL_RES *result = mysql_store_result(conn);
+
+    MYSQL_RES *result =
+        mysql_store_result(conn);
+
 
     if (result == NULL)
     {
@@ -1131,94 +1246,394 @@ void respondToNotification(MYSQL *conn, int notification_id, int faculty_id)
         return;
     }
 
-    MYSQL_ROW row = mysql_fetch_row(result);
+
+    MYSQL_ROW row =
+        mysql_fetch_row(result);
+
 
     if (row == NULL)
     {
-        printf("\nThis notification is no longer available.\n");
+        printf(
+            "\nNotification is no longer available.\n"
+        );
+
         mysql_free_result(result);
         return;
     }
 
-    int session_id = atoi(row[0]);
+
+    int released_session_id = atoi(row[0]);
+    int makeup_request_id = atoi(row[1]);
+    int room_id = atoi(row[2]);
+    int slot_id = atoi(row[3]);
+
 
     mysql_free_result(result);
 
 
-    /*
-     * Update the class ONLY if it is still cancelled.
-     *
-     * This prevents two teachers from accepting
-     * the same class.
-     */
+    // Make sure the released class is still cancelled
 
-    snprintf(query, sizeof(query),
-        "UPDATE class_sessions "
-        "SET faculty_id = %d, status = 'SCHEDULED' "
-        "WHERE session_id = %d "
-        "AND status = 'CANCELLED'",
-        faculty_id, session_id);
+
+    snprintf(
+        query,
+        sizeof(query),
+
+        "SELECT status "
+        "FROM class_sessions "
+        "WHERE session_id = %d",
+
+        released_session_id
+    );
+
 
     if (mysql_query(conn, query) != 0)
     {
-        printf("Failed to accept class: %s\n",
-               mysql_error(conn));
+        printf(
+            "Failed to check released class: %s\n",
+            mysql_error(conn)
+        );
         return;
     }
+
+
+    result = mysql_store_result(conn);
+
+    row = mysql_fetch_row(result);
+
+
+    if (row == NULL ||
+        strcmp(row[0], "CANCELLED") != 0)
+    {
+        printf(
+            "\nThis slot is no longer available.\n"
+        );
+
+        mysql_free_result(result);
+        return;
+    }
+
+
+    mysql_free_result(result);
+
+
+    // Check room conflict
+
+    snprintf(
+        query,
+        sizeof(query),
+
+        "SELECT COUNT(*) "
+        "FROM class_sessions "
+        "WHERE room_id = %d "
+        "AND slot_id = %d "
+        "AND status = 'SCHEDULED'",
+
+        room_id,
+        slot_id
+    );
+
+
+    if (mysql_query(conn, query) != 0)
+    {
+        printf("Room conflict check failed.\n");
+        return;
+    }
+
+
+    result = mysql_store_result(conn);
+    row = mysql_fetch_row(result);
+
+    int roomConflict = atoi(row[0]);
+
+    mysql_free_result(result);
+
+
+    if (roomConflict > 0)
+    {
+        printf(
+            "\nThe room is no longer available.\n"
+        );
+        return;
+    }
+
+
+    // Check faculty conflict
+
+    snprintf(
+        query,
+        sizeof(query),
+
+        "SELECT COUNT(*) "
+        "FROM class_sessions "
+        "WHERE faculty_id = %d "
+        "AND slot_id = %d "
+        "AND status = 'SCHEDULED'",
+
+        faculty_id,
+        slot_id
+    );
+
+
+    if (mysql_query(conn, query) != 0)
+    {
+        printf("Faculty conflict check failed.\n");
+        return;
+    }
+
+
+    result = mysql_store_result(conn);
+    row = mysql_fetch_row(result);
+
+    int facultyConflict = atoi(row[0]);
+
+    mysql_free_result(result);
+
+
+    if (facultyConflict > 0)
+    {
+        printf(
+            "\nYou already have a class during this slot.\n"
+        );
+        return;
+    }
+
+
+    // Create the makeup class
+
+    snprintf(
+        query,
+        sizeof(query),
+
+        "INSERT INTO class_sessions "
+        "(course_id, faculty_id, panel_id, room_id, slot_id, status, session_type) "
+
+        "SELECT "
+        "cs.course_id, "
+        "%d, "
+        "cs.panel_id, "
+        "%d, "
+        "%d, "
+        "'SCHEDULED', "
+        "'MAKEUP' "
+
+        "FROM makeup_requests mr "
+
+        "JOIN class_sessions cs "
+        "ON mr.session_id = cs.session_id "
+
+        "WHERE mr.request_id = %d "
+        "AND mr.faculty_id = %d "
+        "AND mr.status = 'PENDING'",
+
+        faculty_id,
+        room_id,
+        slot_id,
+        makeup_request_id,
+        faculty_id
+    );
+
+
+    if (mysql_query(conn, query) != 0)
+    {
+        printf(
+            "Failed to create makeup class: %s\n",
+            mysql_error(conn)
+        );
+        return;
+    }
+
 
     if (mysql_affected_rows(conn) == 0)
     {
-        printf("\nSorry! This class has already been taken.\n");
+        printf(
+            "\nMakeup request is no longer pending.\n"
+        );
         return;
     }
 
 
-    /*
-     * Mark this teacher's notification as ACCEPTED.
-     */
+    // Mark makeup request as fulfilled
 
-    snprintf(query, sizeof(query),
+    snprintf(
+        query,
+        sizeof(query),
+
+        "UPDATE makeup_requests "
+        "SET status = 'FULFILLED' "
+        "WHERE request_id = %d",
+
+        makeup_request_id
+    );
+
+    mysql_query(conn, query);
+
+
+    // Mark notification as accepted
+
+    snprintf(
+        query,
+        sizeof(query),
+
         "UPDATE notifications "
-        "SET response_status = 'ACCEPTED', is_read = 1 "
-        "WHERE notification_id = %d "
-        "AND faculty_id = %d",
-        notification_id, faculty_id);
+        "SET response_status = 'ACCEPTED', "
+        "is_read = 1 "
+        "WHERE notification_id = %d",
 
-    if (mysql_query(conn, query) != 0)
-    {
-        printf("Failed to update notification: %s\n",
-               mysql_error(conn));
-        return;
-    }
+        notification_id
+    );
+
+    mysql_query(conn, query);
 
 
-    /*
-     * Expire notifications belonging to
-     * other teachers.
-     */
 
-    snprintf(query, sizeof(query),
+    // Expire other teachers' notifications
+
+
+    snprintf(
+        query,
+        sizeof(query),
+
         "UPDATE notifications "
-        "SET response_status = 'EXPIRED', is_read = 1 "
+        "SET response_status = 'EXPIRED', "
+        "is_read = 1 "
         "WHERE session_id = %d "
-        "AND faculty_id <> %d "
+        "AND makeup_request_id = %d "
+        "AND notification_id <> %d "
         "AND response_status = 'PENDING'",
-        session_id, faculty_id);
 
-    if (mysql_query(conn, query) != 0)
+        released_session_id,
+        makeup_request_id,
+        notification_id
+    );
+
+    mysql_query(conn, query);
+
+
+    printf(
+        "\n========================================\n"
+        "       MAKEUP CLASS ACCEPTED!\n"
+        "========================================\n"
+    );
+
+    printf(
+        "A new makeup class has been scheduled.\n"
+    );
+
+    printf(
+        "Room ID : %d\n",
+        room_id
+    );
+
+    printf(
+        "Slot ID : %d\n",
+        slot_id
+    );
+}
+void generateTimetable(MYSQL *conn)
+{
+    TimeSlot slots[MAX_SLOTS];
+
+    int slotCount = loadTimeSlots(conn, slots);
+
+    if (slotCount == 0)
     {
-        printf("Failed to expire other notifications: %s\n",
-               mysql_error(conn));
+        printf("\nNo time slots found.\n");
         return;
     }
 
-    printf("\n========================================\n");
-    printf("       CLASS ACCEPTED SUCCESSFULLY!\n");
-    printf("========================================\n");
 
-    printf("Teacher ID : %d\n", faculty_id);
-    printf("Session ID : %d\n", session_id);
-    printf("Status     : SCHEDULED\n");
+    Session sessions[MAX_SESSIONS];
+
+    int sessionCount = loadSessions(conn, sessions);
+
+    if (sessionCount == 0)
+    {
+        printf("\nNo scheduled classes found.\n");
+        return;
+    }
+
+
+    printf("\n%d scheduled classes loaded.\n",
+           sessionCount);
+
+
+    // Display classes loaded from MySQL
+
+    displaySessions(
+        sessions,
+        sessionCount
+    );
+
+
+    // Build conflict graph
+
+    Graph graph;
+
+    buildConflictGraph(
+        &graph,
+        sessions,
+        sessionCount
+    );
+
+
+    // Display conflict graph
+
+    displayGraph(
+        &graph,
+        sessions
+    );
+
+
+    // Graph coloring
+
+    int color[MAX_SESSIONS];
+
+    for (int i = 0; i < sessionCount; i++)
+    {
+        color[i] = -1;
+
+        // Preserve the slot of an existing makeup class
+        if (strcmp(sessions[i].session_type, "MAKEUP") == 0)
+        {
+            int slotIndex = findSlotIndex(
+                slots,
+                slotCount,
+                sessions[i].slot_id
+            );
+
+            if (slotIndex != -1)
+            {
+                color[i] = slotIndex;
+            }
+        }
+    }
+
+
+    // Use the actual number of slots
+    int totalSlots = slotCount;
+
+
+    if (graphColoring(
+            &graph,
+            color,
+            totalSlots,
+            0))
+    {
+        printf("\nTimetable generated successfully!\n");
+
+
+        displayTimetable(
+            sessions,
+            slots,
+            color,
+            sessionCount
+        );
+    }
+    else
+    {
+        printf("\n");
+        printf("No valid timetable could be generated.\n");
+    }
 }
 
 // MAIN
@@ -1284,206 +1699,29 @@ int main()
 
         switch (choice)
         {
-            // VIEW NOTIFICATIONS
-
             case 1:
-
-                showNotifications(
-                    conn,
-                    current_user_id
-                );
-
+                showNotifications(conn, current_user_id);
                 break;
-
-
-            // GENERATE TIMETABLE
 
             case 2:
-            {
-                // Load time slots
-
-                TimeSlot slots[MAX_SLOTS];
-
-                int slotCount =
-                    loadTimeSlots(
-                        conn,
-                        slots
-                    );
-
-
-                if (slotCount == 0)
-                {
-                    printf("\nNo time slots found.\n");
-                    break;
-                }
-
-
-                // Load classes
-
-                Session sessions[MAX_SESSIONS];
-
-                int sessionCount =
-                    loadSessions(
-                        conn,
-                        sessions
-                    );
-
-
-                if (sessionCount == 0)
-                {
-                    printf("\nNo scheduled classes found.\n");
-                    break;
-                }
-
-
-                printf(
-                    "\n%d scheduled classes loaded.\n",
-                    sessionCount
-                );
-
-
-                // Display database data
-
-                displaySessions(
-                    sessions,
-                    sessionCount
-                );
-
-
-                // Build conflict graph
-
-                Graph graph;
-
-                buildConflictGraph(
-                    &graph,
-                    sessions,
-                    sessionCount
-                );
-
-
-                // Display conflict graph
-
-                displayGraph(
-                    &graph,
-                    sessions
-                );
-
-
-                // Graph coloring
-
-                int color[MAX_SESSIONS];
-
-
-                for (int i = 0;
-                     i < sessionCount;
-                     i++)
-                {
-                    color[i] = -1;
-                }
-
-
-                // We currently have
-                // MAX_SLOTS possible slots
-
-                int totalSlots = MAX_SLOTS;
-
-
-                if (graphColoring(
-                        &graph,
-                        color,
-                        totalSlots,
-                        0))
-                {
-                    printf(
-                        "\nTimetable generated successfully!\n"
-                    );
-
-
-                    displayTimetable(
-                        sessions,
-                        slots,
-                        color,
-                        sessionCount
-                    );
-                }
-                else
-                {
-                    printf(
-                        "\nNo valid timetable could be generated.\n"
-                    );
-                }
-
+                generateTimetable(conn);
                 break;
-            }
-            
+
             case 3:
-            {
-                int session_id;
-
-                printf("\n========================================\n");
-                printf("           CANCEL CLASS\n");
-                printf("========================================\n");
-
-                printf("\nEnter Session ID to cancel: ");
-                scanf("%d", &session_id);
-
-                char query[500];
-
-                snprintf(
-                    query,
-                    sizeof(query),
-                    "UPDATE class_sessions "
-                    "SET status = 'CANCELLED' "
-                    "WHERE session_id = %d "
-                    "AND faculty_id = %d "
-                    "AND status = 'SCHEDULED'",
-                    session_id,
-                    current_user_id
-                );
-
-                if (mysql_query(conn, query) != 0)
-                {
-                    printf("\nFailed to cancel class: %s\n",
-                           mysql_error(conn));
-                }
-                else if (mysql_affected_rows(conn) == 0)
-                {
-                    printf("\nNo scheduled class found for this teacher.\n");
-                }
-                else
-                {
-                    printf("\nClass cancelled successfully!\n");
-
-                    /*
-                     * TODO:
-                     * Create notifications for other teachers
-                     * assigned to the same panel.
-                     */
-                }
-
+                cancelClass(conn, current_user_id);
                 break;
-            }
-
-
-            // EXIT
 
             case 0:
-
                 printf("\nGoodbye!\n");
 
                 mysql_close(conn);
 
                 return 0;
 
-
             default:
-
-                printf(
-                    "\nInvalid choice. Please try again.\n"
-                );
+                printf("\nInvalid choice. Please try again.\n");
         }
     }
-
 
     // This technically won't be reached because
     // case 0 closes the connection.
